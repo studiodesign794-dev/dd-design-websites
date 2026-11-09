@@ -1,0 +1,150 @@
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { DatabaseSync } = require('node:sqlite');
+
+const ROOT = __dirname;
+const DATA = path.resolve(process.env.DD_DATA_DIR || path.join(ROOT, 'private-data'));
+const FILES = path.join(DATA, 'uploads');
+const PUBLIC_FILES = new Set(['/index.html','/styles.css','/script.js','/admin.html','/admin.css','/admin.js','/admin-preview.css','/book.html','/book-page.css','/book-page.js']);
+const NETLIFY_PROXY_SECRET = process.env.DD_NETLIFY_PROXY_SECRET || '';
+const NETLIFY_SITE_ORIGIN = process.env.NETLIFY_SITE_ORIGIN || '';
+if (process.env.NODE_ENV === 'production' && (!NETLIFY_PROXY_SECRET || !NETLIFY_SITE_ORIGIN)) {
+  throw new Error('Production requires DD_NETLIFY_PROXY_SECRET and NETLIFY_SITE_ORIGIN.');
+}
+if (NETLIFY_SITE_ORIGIN) {
+  const siteOrigin = new URL(NETLIFY_SITE_ORIGIN);
+  if (siteOrigin.protocol !== 'https:' || siteOrigin.origin !== NETLIFY_SITE_ORIGIN) {
+    throw new Error('NETLIFY_SITE_ORIGIN must be an HTTPS origin with no path.');
+  }
+}
+fs.mkdirSync(FILES, { recursive: true });
+const db = new DatabaseSync(path.join(DATA, 'dd-design.sqlite'));
+db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS admin (id INTEGER PRIMARY KEY CHECK(id=1), salt TEXT NOT NULL, hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS books (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, original_price REAL NOT NULL, offer_price REAL NOT NULL, cover_id TEXT, pdf_id TEXT, preview_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, book_id TEXT NOT NULL, book_title TEXT NOT NULL, pdf_id TEXT NOT NULL, buyer_name TEXT NOT NULL, email TEXT NOT NULL, whatsapp TEXT NOT NULL, amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', access_hash TEXT UNIQUE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS services (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, price TEXT NOT NULL, image_id TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, name TEXT NOT NULL, whatsapp TEXT NOT NULL, email TEXT NOT NULL, service TEXT NOT NULL, colour TEXT, requirements TEXT NOT NULL, reference_id TEXT, status TEXT NOT NULL DEFAULT 'New', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS contact_enquiries (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'New', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS media (id TEXT PRIMARY KEY, filename TEXT NOT NULL, original_name TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, public INTEGER NOT NULL DEFAULT 0);`);
+if (!db.prepare('PRAGMA table_info(books)').all().some(column => column.name === 'published')) db.exec('ALTER TABLE books ADD COLUMN published INTEGER NOT NULL DEFAULT 1');
+if (!db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'budget')) db.exec("ALTER TABLE requests ADD COLUMN budget TEXT NOT NULL DEFAULT ''");
+
+const sessions = new Map();
+const loginAttempts = new Map();
+const categories = ['AI & Technology','Freelancing','Social Media','Personal Development','Finance','Career & Skills'];
+const designServices = ['Logo Design','Invitation Design','Visiting Card Design','Banner Design','Social Media Post Design'];
+const mimeExt = { 'image/jpeg':'.jpg', 'image/png':'.png', 'image/webp':'.webp', 'image/gif':'.gif', 'application/pdf':'.pdf' };
+const securityHeaders = { 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff', 'X-Frame-Options':'DENY', 'Referrer-Policy':'strict-origin-when-cross-origin', 'Permissions-Policy':'camera=(), microphone=(), geolocation=()', 'Content-Security-Policy':"default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self'; connect-src 'self'" };
+const safeEqual = (a,b) => { const aa=Buffer.from(a), bb=Buffer.from(b); return aa.length===bb.length && crypto.timingSafeEqual(aa,bb); };
+const json = (res,status,value,headers={}) => { res.writeHead(status,{ ...securityHeaders, 'Content-Type':'application/json; charset=utf-8', ...headers }); res.end(JSON.stringify(value)); };
+const parseCookies = (req) => Object.fromEntries((req.headers.cookie||'').split(';').map(x=>x.trim().split('=').map(decodeURIComponent)).filter(x=>x.length===2));
+function validNetlifyProxy(req) {
+  if (!NETLIFY_PROXY_SECRET || !NETLIFY_SITE_ORIGIN) return false;
+  const token = req.headers['x-nf-sign'];
+  if (typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  try {
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (header.alg !== 'HS256' || claims.iss !== 'netlify' || claims.site_url !== NETLIFY_SITE_ORIGIN || !Number.isFinite(claims.exp) || claims.exp <= Math.floor(Date.now()/1000)) return false;
+    const expected = crypto.createHmac('sha256', NETLIFY_PROXY_SECRET).update(`${parts[0]}.${parts[1]}`).digest();
+    const actual = Buffer.from(parts[2], 'base64url');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  } catch { return false; }
+}
+function auth(req) { const s=sessions.get(parseCookies(req).dd_session); if (!s || s.expires<Date.now()) return null; s.expires=Date.now()+8*60*60*1000; return s; }
+function sameOrigin(req) { const origin=req.headers.origin;if(NETLIFY_PROXY_SECRET){if(!validNetlifyProxy(req)||!origin)return false;try{return new URL(origin).origin===NETLIFY_SITE_ORIGIN;}catch{return false;}}const expectedProtocol=req.socket.encrypted||process.env.NODE_ENV==='production'?'https:':'http:';if(origin){try{const parsed=new URL(origin);return parsed.protocol===expectedProtocol&&parsed.host.toLowerCase()===String(req.headers.host||'').toLowerCase();}catch{return false;}}return req.headers['sec-fetch-site']==='same-origin'; }
+function readBody(req,limit=60*1024*1024) { return new Promise((resolve,reject)=>{ const chunks=[]; let size=0; req.on('data',c=>{size+=c.length;if(size>limit){reject(Object.assign(new Error('Upload is too large.'),{status:413}));req.destroy();return;}chunks.push(c);});req.on('end',()=>resolve(Buffer.concat(chunks)));req.on('error',reject); }); }
+function multipart(buffer,boundary) {
+  const out={fields:{},files:{}}; const mark=Buffer.from('--'+boundary); let at=0;
+  while((at=buffer.indexOf(mark,at))!==-1){at+=mark.length;if(buffer[at]===45)break;if(buffer.subarray(at,at+2).equals(Buffer.from('\r\n')))at+=2;const split=buffer.indexOf(Buffer.from('\r\n\r\n'),at);if(split<0)break;const head=buffer.subarray(at,split).toString();let end=buffer.indexOf(mark,split+4);if(end<0)break;let data=buffer.subarray(split+4,end-2);const disposition=head.match(/content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i);const type=head.match(/content-type:\s*([^\r\n]+)/i);if(disposition){const [,name,filename]=disposition;if(filename!==undefined&&filename!=='')out.files[name]={name:path.basename(filename),mime:(type?.[1]||'application/octet-stream').toLowerCase(),data};else out.fields[name]=data.toString('utf8');}at=end;}
+  return out;
+}
+function uploadSignatureMatches(file) { const b=file.data,mime=file.mime; return mime==='image/jpeg'&&b.length>=3&&b[0]===0xff&&b[1]===0xd8&&b[2]===0xff || mime==='image/png'&&b.length>=8&&b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])) || mime==='image/webp'&&b.length>=12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP' || mime==='image/gif'&&b.length>=6&&['GIF87a','GIF89a'].includes(b.toString('ascii',0,6)) || mime==='application/pdf'&&b.length>=8&&b.indexOf(Buffer.from('%PDF-'))>=0&&b.indexOf(Buffer.from('%PDF-'))<=1024; }
+function saveFile(file,publicFile=false,accepted=['image/jpeg','image/png','image/webp','image/gif','application/pdf']) { if(!file)return null;if(!accepted.includes(file.mime))throw Object.assign(new Error('Unsupported file type.'),{status:415});const maxBytes=file.mime==='application/pdf'?50*1024*1024:10*1024*1024;if(file.data.length===0||file.data.length>maxBytes)throw Object.assign(new Error(file.data.length>maxBytes?'File is too large. Images must be 10 MB or smaller; PDFs must be 50 MB or smaller.':'The uploaded file is empty.'),{status:413});if(!uploadSignatureMatches(file))throw Object.assign(new Error('The uploaded file does not match its declared type.'),{status:415});const id=crypto.randomUUID();const filename=id+(mimeExt[file.mime]||'');fs.writeFileSync(path.join(FILES,filename),file.data,{flag:'wx',mode:0o600});db.prepare('INSERT INTO media(id,filename,original_name,mime,bytes,public) VALUES(?,?,?,?,?,?)').run(id,filename,file.name,file.mime,file.data.length,publicFile?1:0);return id; }
+function validateReferenceImage(file){
+  if(!file)return;
+  if(file.data.length>5*1024*1024)throw Object.assign(new Error('Reference images must be 5 MB or smaller.'),{status:413});
+  const b=file.data,mime=file.mime;
+  const valid=mime==='image/jpeg'&&b.length>=3&&b[0]===0xff&&b[1]===0xd8&&b[2]===0xff
+    ||mime==='image/png'&&b.length>=8&&b.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
+    ||mime==='image/webp'&&b.length>=12&&b.toString('ascii',0,4)==='RIFF'&&b.toString('ascii',8,12)==='WEBP'
+    ||mime==='image/gif'&&b.length>=6&&['GIF87a','GIF89a'].includes(b.toString('ascii',0,6));
+  if(!valid)throw Object.assign(new Error('Upload a valid JPEG, PNG, WebP, or GIF reference image.'),{status:415});
+}
+function removeMedia(id){if(!id)return;if(db.prepare('SELECT 1 FROM orders WHERE pdf_id=? LIMIT 1').get(id))return;const m=db.prepare('SELECT filename FROM media WHERE id=?').get(id);if(m){try{fs.unlinkSync(path.join(FILES,m.filename));}catch{}db.prepare('DELETE FROM media WHERE id=?').run(id);}}
+function publicMedia(id){return id?'/media/'+encodeURIComponent(id):'';}
+function bookDto(x){return {id:x.id,title:x.title,description:x.description,category:x.category,original_price:x.original_price,offer_price:x.offer_price,cover_url:publicMedia(x.cover_id)}}
+function serviceDto(x){return {...x,image_url:publicMedia(x.image_id)}}
+function setting(){return db.prepare('SELECT value FROM settings WHERE id=1').get()?.value||'{}';}
+async function handler(req,res){
+  const url=new URL(req.url,'http://localhost');const p=url.pathname;
+  if(req.method==='GET'&&p==='/health')return json(res,200,{ok:true});
+  if(NETLIFY_PROXY_SECRET&&!validNetlifyProxy(req))return json(res,403,{error:'Requests must come through the authorized Netlify site.'});
+  if(req.method==='GET'&&p==='/api/auth/status')return json(res,200,{configured:!!db.prepare('SELECT id FROM admin WHERE id=1').get(),authenticated:!!auth(req)});
+  if(req.method==='POST'&&p.startsWith('/api/auth/')){
+    if(!sameOrigin(req))return json(res,403,{error:'Request origin rejected.'});const raw=await readBody(req,12000);let v;try{v=JSON.parse(raw.toString()||'{}')}catch{return json(res,400,{error:'Invalid request.'})}
+    if(!['/api/auth/setup','/api/auth/login','/api/auth/logout'].includes(p))return json(res,404,{error:'Authentication endpoint not found.'});const addr=req.socket.remoteAddress||'local';const now=Date.now();const a=loginAttempts.get(addr)||{count:0,until:0};if(a.until>now)return json(res,429,{error:'Too many attempts. Try again shortly.'});
+    if(p==='/api/auth/setup'){if(db.prepare('SELECT id FROM admin WHERE id=1').get())return json(res,409,{error:'Owner account is already configured.'});if(typeof v.password!=='string'||v.password.length<12)return json(res,400,{error:'Use a password with at least 12 characters.'});const salt=crypto.randomBytes(16);const hash=await new Promise((resolve,reject)=>crypto.scrypt(v.password,salt,64,(e,x)=>e?reject(e):resolve(x)));db.prepare('INSERT INTO admin(id,salt,hash) VALUES(1,?,?)').run(salt.toString('hex'),hash.toString('hex'));return json(res,200,{ok:true});}
+    if(p==='/api/auth/login'){const row=db.prepare('SELECT salt,hash FROM admin WHERE id=1').get();if(!row)return json(res,409,{error:'Complete owner setup first.'});const hash=await new Promise((resolve,reject)=>crypto.scrypt(String(v.password||''),Buffer.from(row.salt,'hex'),64,(e,x)=>e?reject(e):resolve(x)));if(!safeEqual(hash.toString('hex'),row.hash)){a.count++;if(a.count>=6){a.count=0;a.until=now+5*60*1000;}loginAttempts.set(addr,a);return json(res,401,{error:'Email/password did not match.'});}loginAttempts.delete(addr);const token=crypto.randomBytes(32).toString('hex');sessions.set(token,{expires:now+8*60*60*1000});const secureCookie=req.socket.encrypted||process.env.NODE_ENV==='production';return json(res,200,{ok:true},{'Set-Cookie':`dd_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secureCookie?'; Secure':''}`});}
+    if(p==='/api/auth/logout'){const token=parseCookies(req).dd_session;sessions.delete(token);return json(res,200,{ok:true},{'Set-Cookie':'dd_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'});}
+  }
+  if(req.method==='GET'&&p==='/api/site')return json(res,200,JSON.parse(setting()));
+  if(req.method==='GET'&&p==='/api/books')return json(res,200,db.prepare('SELECT * FROM books WHERE published=1 AND pdf_id IS NOT NULL ORDER BY created_at DESC').all().map(bookDto));
+  if(req.method==='GET'&&p.startsWith('/api/books/')){const book=db.prepare('SELECT * FROM books WHERE id=? AND published=1 AND pdf_id IS NOT NULL').get(decodeURIComponent(p.slice('/api/books/'.length)));return book?json(res,200,bookDto(book)):json(res,404,{error:'Book not found.'});}
+  if(req.method==='POST'&&p==='/api/orders'){
+    if(!sameOrigin(req))return json(res,403,{error:'Request origin rejected.'});let v;try{v=JSON.parse((await readBody(req,20000)).toString()||'{}')}catch{return json(res,400,{error:'Invalid order details.'})}
+    const name=String(v.name||'').trim(),email=String(v.email||'').trim(),whatsapp=String(v.whatsapp||'').trim(),bookId=String(v.book_id||'');if(name.length<2||name.length>160||!/^\S+@\S+\.\S+$/.test(email)||email.length>240||whatsapp.length<7||whatsapp.length>40)return json(res,400,{error:'Enter your name, a valid email, and a WhatsApp number.'});
+    const book=db.prepare('SELECT * FROM books WHERE id=? AND published=1').get(bookId);if(!book)return json(res,404,{error:'This book is not available.'});if(!book.pdf_id)return json(res,409,{error:'This book is not ready for digital purchase yet. Please contact DD Design.'});const media=db.prepare('SELECT mime FROM media WHERE id=?').get(book.pdf_id);if(!media||media.mime!=='application/pdf')return json(res,409,{error:'The book file is not available yet.'});
+    const id=crypto.randomUUID();db.prepare('INSERT INTO orders(id,book_id,book_title,pdf_id,buyer_name,email,whatsapp,amount) VALUES(?,?,?,?,?,?,?,?)').run(id,book.id,book.title,book.pdf_id,name,email,whatsapp,book.offer_price);return json(res,201,{ok:true,order_id:id,status:'Pending',message:'Your purchase request is in. DD Design will contact you with payment instructions. Your download link is issued only after payment is confirmed.'});
+  }
+  if(req.method==='GET'&&p.startsWith('/api/download/')){
+    const token=p.slice('/api/download/'.length);if(!/^[A-Za-z0-9_-]{40,}$/.test(token))return json(res,404,{error:'Download link not found.'});const digest=crypto.createHash('sha256').update(token).digest('hex');const order=db.prepare("SELECT o.book_title,m.filename,m.mime,m.bytes FROM orders o JOIN media m ON m.id=o.pdf_id WHERE o.access_hash=? AND o.status='Paid'").get(digest);if(!order||order.mime!=='application/pdf')return json(res,404,{error:'This download link is invalid or payment has not been confirmed.'});const filename=order.book_title.normalize('NFKD').replace(/[^a-zA-Z0-9 _-]/g,'').trim().replace(/\s+/g,'-').slice(0,100)||'DD-Design-book';res.writeHead(200,{'Content-Type':'application/pdf','Content-Length':order.bytes,'X-Content-Type-Options':'nosniff','Cache-Control':'private, no-store','Content-Disposition':`attachment; filename="${filename}.pdf"`});return fs.createReadStream(path.join(FILES,order.filename)).pipe(res);
+  }
+  if(req.method==='GET'&&p==='/api/services')return json(res,200,db.prepare('SELECT * FROM services ORDER BY created_at DESC').all().map(serviceDto));
+  if(req.method==='POST'&&p==='/api/requests'){
+    if(!sameOrigin(req))return json(res,403,{error:'Request origin rejected.'});const ct=req.headers['content-type']||'';const boundary=ct.match(/boundary=(?:"([^"]+)"|([^;]+))/i);if(!boundary)return json(res,400,{error:'Expected a form submission.'});const form=multipart(await readBody(req,8*1024*1024),boundary[1]||boundary[2]);const f=form.fields;
+    const name=String(f.name||'').trim(),whatsapp=String(f.whatsapp||'').trim(),email=String(f.email||'').trim(),service=String(f.service||'').trim(),budget=String(f.budget||'').trim(),requirements=String(f.requirements||'').trim();
+    const budgets=['Under ₹1,000','₹1,000–₹3,000','₹3,000–₹5,000','₹5,000+','Flexible'],validServices=new Set([...designServices,...db.prepare('SELECT name FROM services').all().map(item=>item.name)]);
+    if(name.length<2||name.length>160||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>240||whatsapp.length>40||whatsapp.replace(/\D/g,'').length<7||service.length>120||!validServices.has(service)||!budgets.includes(budget)||requirements.length<5||requirements.length>10000)return json(res,400,{error:'Please enter a valid name, email, WhatsApp number, service, budget, and design requirements.'});
+    const reference=form.files.reference;try{validateReferenceImage(reference);}catch(e){return json(res,e.status||400,{error:e.message});}
+    let ref=null;try{ref=saveFile(reference,false,['image/jpeg','image/png','image/webp','image/gif']);db.prepare('INSERT INTO requests(id,name,whatsapp,email,service,budget,colour,requirements,reference_id) VALUES(?,?,?,?,?,?,?,?,?)').run(crypto.randomUUID(),name,whatsapp,email,service,budget,String(f.colour||'').slice(0,120),requirements,ref);}catch(e){if(ref)removeMedia(ref);console.error(e);return json(res,e.status||500,{error:e.status?e.message:'Your request could not be saved. Please try again.'});}return json(res,201,{ok:true,message:'Thanks — your design request has been received. We’ll be in touch soon.'});
+  }
+  if(req.method==='POST'&&p==='/api/contact-enquiries'){
+    if(!sameOrigin(req))return json(res,403,{error:'Request origin rejected.'});let v;try{v=JSON.parse((await readBody(req,30000)).toString()||'{}')}catch{return json(res,400,{error:'Enter your details and try again.'})}
+    const name=String(v.name||'').trim(),email=String(v.email||'').trim(),message=String(v.message||'').trim();
+    if(name.length<2||name.length>160||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>240||message.length<5||message.length>10000)return json(res,400,{error:'Please enter a valid name and email, and a message of at least 5 characters.'});
+    try{db.prepare('INSERT INTO contact_enquiries(id,name,email,message) VALUES(?,?,?,?)').run(crypto.randomUUID(),name,email,message);}catch(e){console.error(e);return json(res,500,{error:'Your enquiry could not be saved. Please try again.'});}
+    return json(res,201,{ok:true,message:'Thank you. Your enquiry has been sent to DD Design.'});
+  }
+  if(p.startsWith('/media/')){const m=db.prepare('SELECT * FROM media WHERE id=?').get(decodeURIComponent(p.slice(7)));if(!m)return json(res,404,{error:'File not found.'});if((!m.public||m.mime==='application/pdf')&&!auth(req))return json(res,401,{error:'Sign in to view this file.'});const file=path.join(FILES,m.filename);if(!fs.existsSync(file))return json(res,404,{error:'File not found.'});res.writeHead(200,{'Content-Type':m.mime,'Content-Length':m.bytes,'X-Content-Type-Options':'nosniff','Cache-Control':m.public&&m.mime!=='application/pdf'?'public, max-age=300':'private, no-store','Content-Disposition':'inline'});return fs.createReadStream(file).pipe(res);}
+  if(p.startsWith('/api/admin/')){
+    if(!auth(req))return json(res,401,{error:'Your owner session expired. Please sign in again.'});if(!sameOrigin(req))return json(res,403,{error:'Request origin rejected.'});
+    if(req.method==='GET'&&p==='/api/admin/overview')return json(res,200,{books:db.prepare('SELECT COUNT(*) n FROM books').get().n,services:db.prepare('SELECT COUNT(*) n FROM services').get().n,requests:db.prepare("SELECT COUNT(*) n FROM requests WHERE status='New'").get().n,orders:db.prepare("SELECT COUNT(*) n FROM orders WHERE status='Pending'").get().n,contactEnquiries:db.prepare("SELECT COUNT(*) n FROM contact_enquiries WHERE status='New'").get().n});
+    if(req.method==='GET'&&p==='/api/admin/books')return json(res,200,db.prepare('SELECT * FROM books ORDER BY created_at DESC').all());
+    if(req.method==='POST'&&p==='/api/admin/books'){const boundary=req.headers['content-type']?.match(/boundary=(?:"([^"]+)"|([^;]+))/i)?.slice(1).find(Boolean);if(!boundary)return json(res,400,{error:'Expected a book form submission.'});const form=multipart(await readBody(req),boundary);const f=form.fields;if(!f.title?.trim()||!f.description?.trim()||!categories.includes(f.category))return json(res,400,{error:'Title, description and a valid category are required.'});const op=Number(f.original_price),offer=Number(f.offer_price);if(!Number.isFinite(op)||!Number.isFinite(offer)||op<0||offer<0)return json(res,400,{error:'Enter valid non-negative prices.'});const id=f.id||crypto.randomUUID();const old=f.id?db.prepare('SELECT * FROM books WHERE id=?').get(id):null;if(f.id&&!old)return json(res,404,{error:'Book not found.'});let cover=old?.cover_id||null,pdf=old?.pdf_id||null,preview=old?.preview_id||null;try{if(form.files.cover){const n=saveFile(form.files.cover,true,['image/jpeg','image/png','image/webp']);if(cover)removeMedia(cover);cover=n;}if(form.files.pdf){const n=saveFile(form.files.pdf,false,['application/pdf']);if(pdf)removeMedia(pdf);pdf=n;}}catch(e){return json(res,e.status||400,{error:e.message});}const published=f.published==='on'||f.published==='1'?1:0;if(published&&!pdf)return json(res,400,{error:'Upload the book PDF before publishing it to the storefront.'});const values=[String(f.title).trim().slice(0,200),String(f.description).trim().slice(0,10000),f.category,op,offer,cover,pdf,preview,published];if(old)db.prepare('UPDATE books SET title=?,description=?,category=?,original_price=?,offer_price=?,cover_id=?,pdf_id=?,preview_id=?,published=? WHERE id=?').run(...values,id);else db.prepare('INSERT INTO books(id,title,description,category,original_price,offer_price,cover_id,pdf_id,preview_id,published) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id,...values);return json(res,200,{ok:true});}
+    let m=p.match(/^\/api\/admin\/books\/([^/]+)\/publish$/);if(req.method==='PATCH'&&m){let v;try{v=JSON.parse((await readBody(req,3000)).toString()||'{}')}catch{return json(res,400,{error:'Invalid publication setting.'})}if(typeof v.published!=='boolean')return json(res,400,{error:'Choose whether this book should be published.'});const book=db.prepare('SELECT pdf_id FROM books WHERE id=?').get(m[1]);if(!book)return json(res,404,{error:'Book not found.'});if(v.published&&!book.pdf_id)return json(res,409,{error:'Upload the book PDF before publishing it.'});db.prepare('UPDATE books SET published=? WHERE id=?').run(v.published?1:0,m[1]);return json(res,200,{ok:true});}
+    m=p.match(/^\/api\/admin\/books\/([^/]+)$/);if(req.method==='DELETE'&&m){const x=db.prepare('SELECT * FROM books WHERE id=?').get(m[1]);if(!x)return json(res,404,{error:'Book not found.'});db.prepare('DELETE FROM books WHERE id=?').run(m[1]);[x.cover_id,x.pdf_id,x.preview_id].forEach(removeMedia);return json(res,200,{ok:true});}
+    if(req.method==='GET'&&p==='/api/admin/services')return json(res,200,db.prepare('SELECT * FROM services ORDER BY created_at DESC').all());
+    if(req.method==='POST'&&p==='/api/admin/services'){const boundary=req.headers['content-type'].match(/boundary=(?:"([^"]+)"|([^;]+))/i)?.slice(1).find(Boolean);if(!boundary)return json(res,400,{error:'Expected a form submission.'});const form=multipart(await readBody(req),boundary);const f=form.fields;if(!f.name||!f.description)return json(res,400,{error:'Name and description are required.'});const id=f.id||crypto.randomUUID(),old=f.id?db.prepare('SELECT * FROM services WHERE id=?').get(id):null;if(f.id&&!old)return json(res,404,{error:'Service not found.'});let image=old?.image_id||null;if(form.files.image){const n=saveFile(form.files.image,true,['image/jpeg','image/png','image/webp']);if(image)removeMedia(image);image=n;}const values=[String(f.name).slice(0,160),String(f.description).slice(0,3000),String(f.price||'').slice(0,100),image];if(old)db.prepare('UPDATE services SET name=?,description=?,price=?,image_id=? WHERE id=?').run(...values,id);else db.prepare('INSERT INTO services(id,name,description,price,image_id) VALUES(?,?,?,?,?)').run(id,...values);return json(res,200,{ok:true});}
+    m=p.match(/^\/api\/admin\/services\/([^/]+)$/);if(req.method==='DELETE'&&m){const x=db.prepare('SELECT * FROM services WHERE id=?').get(m[1]);if(!x)return json(res,404,{error:'Service not found.'});db.prepare('DELETE FROM services WHERE id=?').run(m[1]);removeMedia(x.image_id);return json(res,200,{ok:true});}
+    if(p==='/api/admin/settings'&&req.method==='GET')return json(res,200,JSON.parse(setting()));
+    if(p==='/api/admin/settings'&&req.method==='POST'){const v=JSON.parse((await readBody(req,25000)).toString()||'{}');for(const k of ['heading','description','mobile','whatsapp','email','instagram','facebook'])if(typeof v[k]!=='string')return json(res,400,{error:'All settings must be text values.'});for(const k of Object.keys(v))v[k]=v[k].slice(0,2000);db.prepare('INSERT INTO settings(id,value) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(JSON.stringify(v));return json(res,200,{ok:true});}
+    if(p==='/api/admin/requests'&&req.method==='GET')return json(res,200,db.prepare('SELECT * FROM requests ORDER BY created_at DESC').all().map(x=>({...x,reference_url:publicMedia(x.reference_id)})));
+    if(req.method==='GET'&&p==='/api/admin/contact-enquiries')return json(res,200,db.prepare('SELECT id,name,email,message,status,created_at FROM contact_enquiries ORDER BY created_at DESC').all());
+    m=p.match(/^\/api\/admin\/contact-enquiries\/([^/]+)$/);if(req.method==='PATCH'&&m){let v;try{v=JSON.parse((await readBody(req,5000)).toString()||'{}')}catch{return json(res,400,{error:'Invalid enquiry status.'})}if(!['New','Replied','Archived'].includes(v.status))return json(res,400,{error:'Choose a valid enquiry status.'});if(!db.prepare('UPDATE contact_enquiries SET status=? WHERE id=?').run(v.status,m[1]).changes)return json(res,404,{error:'Enquiry not found.'});return json(res,200,{ok:true});}
+    if(req.method==='GET'&&p==='/api/admin/orders')return json(res,200,db.prepare('SELECT id,book_id,book_title,buyer_name,email,whatsapp,amount,status,created_at,CASE WHEN access_hash IS NULL THEN 0 ELSE 1 END AS link_created FROM orders ORDER BY created_at DESC').all());
+    m=p.match(/^\/api\/admin\/orders\/([^/]+)$/);if(m&&req.method==='PATCH'){let v;try{v=JSON.parse((await readBody(req,5000)).toString()||'{}')}catch{return json(res,400,{error:'Invalid order status.'})}if(!['Pending','Paid','Cancelled'].includes(v.status))return json(res,400,{error:'Invalid order status.'});if(!db.prepare('UPDATE orders SET status=? WHERE id=?').run(v.status,m[1]).changes)return json(res,404,{error:'Order not found.'});return json(res,200,{ok:true});}
+    m=p.match(/^\/api\/admin\/orders\/([^/]+)\/access-link$/);if(m&&req.method==='POST'){const order=db.prepare("SELECT id,status FROM orders WHERE id=? AND status='Paid'").get(m[1]);if(!order)return json(res,409,{error:'Confirm payment before creating a download link.'});const token=crypto.randomBytes(32).toString('base64url'),digest=crypto.createHash('sha256').update(token).digest('hex');db.prepare('UPDATE orders SET access_hash=? WHERE id=?').run(digest,order.id);return json(res,200,{ok:true,download_url:`/api/download/${token}`});}
+    m=p.match(/^\/api\/admin\/requests\/([^/]+)$/);if(m&&req.method==='PATCH'){const v=JSON.parse((await readBody(req,5000)).toString()||'{}');if(!['New','In progress','Completed','Archived'].includes(v.status))return json(res,400,{error:'Invalid request status.'});if(!db.prepare('UPDATE requests SET status=? WHERE id=?').run(v.status,m[1]).changes)return json(res,404,{error:'Request not found.'});return json(res,200,{ok:true});}
+    return json(res,404,{error:'Admin endpoint not found.'});
+  }
+  if(req.method!=='GET'&&req.method!=='HEAD')return json(res,405,{error:'Method not allowed.'});
+  const target=p==='/'?'/index.html':p;if(!PUBLIC_FILES.has(target))return json(res,404,{error:'Not found.'});const file=path.join(ROOT,target.slice(1));if(!fs.existsSync(file)||!fs.statSync(file).isFile())return json(res,404,{error:'Not found.'});const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8'};res.writeHead(200,{...securityHeaders,'Content-Type':types[path.extname(file)]});if(req.method==='HEAD')return res.end();fs.createReadStream(file).pipe(res);
+}
+const PORT=Number(process.env.PORT||4174);const HOST=process.env.HOST||'0.0.0.0';http.createServer((req,res)=>handler(req,res).catch(e=>{if(!res.headersSent)json(res,e.status||500,{error:e.status?e.message:'Server error.'});else res.destroy();console.error(e);})).listen(PORT,HOST,()=>console.log(`DD Design listening on ${HOST}:${PORT} (local website: http://127.0.0.1:${PORT}/; owner dashboard: /admin.html)`));
