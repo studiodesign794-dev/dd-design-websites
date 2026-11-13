@@ -4,3 +4,9 @@
 
 [build.environment]
   NODE_VERSION = "24"
+[[redirects]]
+  from = "/api/*"
+  to = "https://dd-design-websites.onrender.com/api/:splat"
+  status = 200
+  force = true
+  signed = "DD_NETLIFY_PROXY_SECRET"
